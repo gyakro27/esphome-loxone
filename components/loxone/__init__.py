@@ -1,17 +1,16 @@
 import esphome.codegen as cg
 import esphome.config_validation as cv
 from esphome import automation
-from esphome.components import uart
 from esphome.const import (
     CONF_ID,
     CONF_TRIGGER_ID,
 )
+from esphome.core import CORE
 
-DEPENDENCIES = ['network']
-AUTO_LOAD = ['async_tcp']
+DEPENDENCIES = ['network', 'socket']
 
 loxone_ns = cg.esphome_ns.namespace('loxone')
-LoxoneComponent = loxone_ns.class_('LoxoneComponent', cg.PollingComponent)
+LoxoneComponent = loxone_ns.class_('LoxoneComponent', cg.Component)
 OnStringDataTrigger = loxone_ns.class_("OnStringDataTrigger",
                                  automation.Trigger.template(cg.std_string, cg.Component))
 
@@ -20,7 +19,17 @@ LOXONE_PROTOCOLS = {
     "udp": "udp"
 }
 
-CONFIG_SCHEMA = cv.Schema({
+
+def _require_esp_idf(config):
+    if not CORE.using_esp_idf:
+        raise cv.Invalid(
+            "The loxone component requires the esp-idf framework. "
+            "Set 'esp32: framework: type: esp-idf' in your configuration."
+        )
+    return config
+
+
+CONFIG_SCHEMA = cv.All(cv.Schema({
     cv.GenerateID(): cv.declare_id(LoxoneComponent),
     cv.Required("protocol"): cv.enum(LOXONE_PROTOCOLS),
     cv.Required("loxone_ip"): cv.ipv4address,
@@ -33,11 +42,9 @@ CONFIG_SCHEMA = cv.Schema({
             cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(OnStringDataTrigger),
         }
     ),
-}).extend(cv.COMPONENT_SCHEMA)
+}).extend(cv.COMPONENT_SCHEMA), _require_esp_idf)
 
 def to_code(config):
-    cg.add_library("ESP32 Async UDP", None)
-    #cg.add_library("esphome/AsyncTCP-esphome", "2.0.1")
     var = cg.new_Pvariable(config[CONF_ID])
     cg.add(var.set_protocol(config["protocol"]))
     cg.add(var.set_loxone_ip(str(config["loxone_ip"])))
@@ -49,6 +56,5 @@ def to_code(config):
 
     for conf in config.get("on_string_data", []):
         trigger = cg.new_Pvariable(conf[CONF_TRIGGER_ID], var)
-        #yield cg.register_component(trigger, conf)
         cg.add(var.add_string_trigger(trigger))
         yield automation.build_automation(trigger, [(cg.std_string, "data")], conf)

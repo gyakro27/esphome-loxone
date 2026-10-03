@@ -1,13 +1,22 @@
 # Loxone Component
 more information, you can check with KinCony's webpage: https://www.kincony.com
 
+> **v3 requires the ESP-IDF framework.** Set `esp32: framework: type: esp-idf`
+> in your configuration. The Arduino framework is no longer supported
+> (the component was rewritten from AsyncTCP/AsyncUDP to ESP-IDF sockets).
+
 # Core Yaml
 ```yaml
 external_components:
   - source:
       type: git
       url: https://github.com/hzkincony/esphome-loxone
-      ref: v1.2.2
+      ref: v3
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
 
 switch:
   - platform: gpio

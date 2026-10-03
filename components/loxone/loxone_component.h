@@ -1,12 +1,12 @@
 #pragma once
 
-#include <string>
+#include <memory>
 #include <queue>
+#include <string>
+#include <vector>
 
-#include "esphome.h"
 #include "esphome/core/component.h"
-#include "AsyncUDP.h"
-#include "AsyncTCP.h"
+#include "esphome/components/socket/socket.h"
 
 #define TAG "loxone"
 
@@ -14,11 +14,11 @@ namespace esphome {
   namespace loxone {
     class OnStringDataTrigger;
 
-    class LoxoneComponent : public PollingComponent {
+    class LoxoneComponent : public Component {
     public:
-      LoxoneComponent() : PollingComponent(5000) {};
       void setup() override;
-      void update() override;
+      void loop() override;
+      void dump_config() override;
       void send_string_data(std::string data);
       void set_protocol(std::string protocol) {
         this->protocol_ = protocol;
@@ -50,20 +50,29 @@ namespace esphome {
       uint16_t listen_port_;
       uint8_t send_buffer_length_;
       std::string delimiter_;
-      AsyncUDP udp_client_;
-      AsyncUDP udp_server_;
-      AsyncClient tcp_client_;
-      AsyncServer* tcp_server_;
+
+      std::unique_ptr<socket::Socket> udp_socket_{nullptr};
+      std::unique_ptr<socket::Socket> tcp_listen_socket_{nullptr};
+      std::unique_ptr<socket::Socket> tcp_client_socket_{nullptr};
+      std::vector<std::unique_ptr<socket::Socket>> tcp_server_clients_{};
+
       std::string receive_string_buffer_;
       std::queue<std::string> send_string_buffer_{};
       bool server_ready_ = false;
       bool client_ready_ = false;
+      bool tcp_connecting_ = false;
+      uint32_t last_tcp_connect_attempt_ = 0;
 
+      void teardown_();
       void ensure_listen_udp();
       void ensure_listen_tcp();
-      void fire_triggers();
       void ensure_connect_tcp();
-      void ensure_connect_udp();
+      void poll_udp();
+      void poll_tcp_server();
+      void poll_tcp_client();
+      void flush_send_buffer();
+      void send_data(const std::string &data);
+      void fire_triggers();
     };
 
     class OnStringDataTrigger : public Trigger<std::string>, public Component {

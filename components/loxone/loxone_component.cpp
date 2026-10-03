@@ -1,191 +1,333 @@
 #include "loxone_component.h"
 
+#include <cerrno>
+#include <cstring>
+
+#include "esphome/core/hal.h"
+#include "esphome/core/log.h"
+#include "esphome/components/network/util.h"
+
 namespace esphome {
   namespace loxone {
+    static const uint32_t TCP_CONNECT_RETRY_INTERVAL_MS = 5000;
+    static const uint8_t MAX_PACKETS_PER_LOOP = 8;
+
     void LoxoneComponent::setup() {
 
     }
 
+    void LoxoneComponent::dump_config() {
+      ESP_LOGCONFIG(TAG, "Loxone:");
+      ESP_LOGCONFIG(TAG, "  protocol: %s", this->protocol_.c_str());
+      ESP_LOGCONFIG(TAG, "  loxone address: %s:%u", this->loxone_ip_.c_str(), this->loxone_port_);
+      ESP_LOGCONFIG(TAG, "  listen port: %u", this->listen_port_);
+    }
+
+    void LoxoneComponent::teardown_() {
+      this->udp_socket_ = nullptr;
+      this->tcp_listen_socket_ = nullptr;
+      this->tcp_client_socket_ = nullptr;
+      this->tcp_server_clients_.clear();
+      this->server_ready_ = false;
+      this->client_ready_ = false;
+      this->tcp_connecting_ = false;
+    }
+
     void LoxoneComponent::ensure_listen_udp() {
-      if (protocol_ != "udp") {
+      if (this->protocol_ != "udp") {
         return;
       }
 
-      if (server_ready_) {
+      if (this->server_ready_) {
         return;
       }
 
-      if (udp_server_.listen(listen_port_)) {
-        server_ready_ = true;
-        ESP_LOGD(TAG, "listened");
-        udp_server_.onPacket([this](AsyncUDPPacket packet) {
-          ESP_LOGD(TAG, "receive data, length=%d, data=%s", packet.length(), packet.data());
-          receive_string_buffer_.append((char*)packet.data(), packet.length());
-          ESP_LOGD(TAG, "current buffer data=%s", receive_string_buffer_.c_str());
-          fire_triggers();
-        });
+      this->udp_socket_ = socket::socket_ip(SOCK_DGRAM, IPPROTO_UDP);
+      if (this->udp_socket_ == nullptr) {
+        ESP_LOGW(TAG, "could not create udp socket");
+        return;
+      }
+      this->udp_socket_->setblocking(false);
+
+      struct sockaddr_storage bind_addr;
+      socklen_t addr_len = socket::set_sockaddr_any((struct sockaddr *) &bind_addr, sizeof(bind_addr), this->listen_port_);
+      if (this->udp_socket_->bind((struct sockaddr *) &bind_addr, addr_len) != 0) {
+        ESP_LOGW(TAG, "udp bind to port %u failed: errno %d", this->listen_port_, errno);
+        this->udp_socket_ = nullptr;
+        return;
+      }
+
+      this->server_ready_ = true;
+      // UDP is connectionless: once the socket is up, we can send
+      this->client_ready_ = true;
+      ESP_LOGD(TAG, "listening on udp port %u", this->listen_port_);
+    }
+
+    void LoxoneComponent::poll_udp() {
+      if (this->protocol_ != "udp" || this->udp_socket_ == nullptr) {
+        return;
+      }
+
+      uint8_t buf[1024];
+      for (uint8_t i = 0; i < MAX_PACKETS_PER_LOOP; i++) {
+        ssize_t len = this->udp_socket_->read(buf, sizeof(buf));
+        if (len <= 0) {
+          break;
+        }
+        ESP_LOGD(TAG, "receive data, length=%d, data=%.*s", len, (int) len, (char *) buf);
+        this->receive_string_buffer_.append((char *) buf, len);
+        ESP_LOGD(TAG, "current buffer data=%s", this->receive_string_buffer_.c_str());
+        this->fire_triggers();
       }
     }
 
     void LoxoneComponent::ensure_listen_tcp() {
-      if (protocol_ != "tcp") {
+      if (this->protocol_ != "tcp") {
         return;
       }
 
-      if (server_ready_) {
+      if (this->server_ready_) {
         return;
       }
 
-      tcp_server_ = new AsyncServer(listen_port_);
-      tcp_server_->onClient([this](void* arg, AsyncClient *client) {
-        IPAddress ip = client->remoteIP();
-        ESP_LOGD(TAG, "new client connected, ip: %s", ip.toString().c_str());
-        client->onData([this](void* arg, AsyncClient *client, void *data, size_t len) {
-          ESP_LOGD(TAG, "receive data, length=%d, data=%s", len, data);
-          receive_string_buffer_.append((char*)data, len);
-          ESP_LOGD(TAG, "current buffer data=%s", receive_string_buffer_.c_str());
-          fire_triggers();
-        }, nullptr);
-      }, nullptr);
-      tcp_server_->begin();
-      server_ready_ = true;
-      ESP_LOGD(TAG, "listened");
+      this->tcp_listen_socket_ = socket::socket_ip(SOCK_STREAM, IPPROTO_TCP);
+      if (this->tcp_listen_socket_ == nullptr) {
+        ESP_LOGW(TAG, "could not create tcp listen socket");
+        return;
+      }
+      this->tcp_listen_socket_->setblocking(false);
+      int enable = 1;
+      this->tcp_listen_socket_->setsockopt(SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(enable));
+
+      struct sockaddr_storage bind_addr;
+      socklen_t addr_len = socket::set_sockaddr_any((struct sockaddr *) &bind_addr, sizeof(bind_addr), this->listen_port_);
+      if (this->tcp_listen_socket_->bind((struct sockaddr *) &bind_addr, addr_len) != 0) {
+        ESP_LOGW(TAG, "tcp bind to port %u failed: errno %d", this->listen_port_, errno);
+        this->tcp_listen_socket_ = nullptr;
+        return;
+      }
+      if (this->tcp_listen_socket_->listen(4) != 0) {
+        ESP_LOGW(TAG, "tcp listen failed: errno %d", errno);
+        this->tcp_listen_socket_ = nullptr;
+        return;
+      }
+
+      this->server_ready_ = true;
+      ESP_LOGD(TAG, "listening on tcp port %u", this->listen_port_);
+    }
+
+    void LoxoneComponent::poll_tcp_server() {
+      if (this->protocol_ != "tcp" || this->tcp_listen_socket_ == nullptr) {
+        return;
+      }
+
+      // accept pending connections
+      for (uint8_t i = 0; i < MAX_PACKETS_PER_LOOP; i++) {
+        auto client = this->tcp_listen_socket_->accept(nullptr, nullptr);
+        if (client == nullptr) {
+          break;
+        }
+        client->setblocking(false);
+        ESP_LOGD(TAG, "new client connected");
+        this->tcp_server_clients_.push_back(std::move(client));
+      }
+
+      // read from connected clients
+      uint8_t buf[1024];
+      for (size_t c = 0; c < this->tcp_server_clients_.size(); c++) {
+        auto &client = this->tcp_server_clients_[c];
+        bool dead = false;
+        for (uint8_t i = 0; i < MAX_PACKETS_PER_LOOP; i++) {
+          ssize_t len = client->read(buf, sizeof(buf));
+          if (len == 0) {
+            // orderly shutdown by peer
+            dead = true;
+            break;
+          }
+          if (len < 0) {
+            if (errno != EWOULDBLOCK && errno != EAGAIN) {
+              dead = true;
+            }
+            break;
+          }
+          ESP_LOGD(TAG, "receive data, length=%d, data=%.*s", len, (int) len, (char *) buf);
+          this->receive_string_buffer_.append((char *) buf, len);
+          ESP_LOGD(TAG, "current buffer data=%s", this->receive_string_buffer_.c_str());
+          this->fire_triggers();
+        }
+        if (dead) {
+          ESP_LOGD(TAG, "client disconnected");
+          this->tcp_server_clients_.erase(this->tcp_server_clients_.begin() + c);
+          c--;
+        }
+      }
+    }
+
+    void LoxoneComponent::ensure_connect_tcp() {
+      if (this->protocol_ != "tcp") {
+        return;
+      }
+
+      if (this->client_ready_) {
+        return;
+      }
+
+      if (this->tcp_connecting_) {
+        // re-issuing connect() on a connecting socket tells us the outcome:
+        // errno EISCONN means established, EALREADY/EINPROGRESS means still connecting
+        struct sockaddr_storage dest_addr;
+        socklen_t addr_len = socket::set_sockaddr((struct sockaddr *) &dest_addr, sizeof(dest_addr), this->loxone_ip_, this->loxone_port_);
+        int err = this->tcp_client_socket_->connect((struct sockaddr *) &dest_addr, addr_len);
+        if (err == 0 || errno == EISCONN) {
+          ESP_LOGD(TAG, "client connected");
+          this->client_ready_ = true;
+          this->tcp_connecting_ = false;
+        } else if (errno == EALREADY || errno == EINPROGRESS || errno == EWOULDBLOCK) {
+          ESP_LOGD(TAG, "client still connecting");
+        } else {
+          ESP_LOGD(TAG, "client connect failed: errno %d", errno);
+          this->tcp_client_socket_ = nullptr;
+          this->tcp_connecting_ = false;
+        }
+        return;
+      }
+
+      uint32_t now = millis();
+      if (now - this->last_tcp_connect_attempt_ < TCP_CONNECT_RETRY_INTERVAL_MS) {
+        return;
+      }
+      this->last_tcp_connect_attempt_ = now;
+
+      this->tcp_client_socket_ = socket::socket_ip(SOCK_STREAM, IPPROTO_TCP);
+      if (this->tcp_client_socket_ == nullptr) {
+        ESP_LOGW(TAG, "could not create tcp client socket");
+        return;
+      }
+      this->tcp_client_socket_->setblocking(false);
+
+      struct sockaddr_storage dest_addr;
+      socklen_t addr_len = socket::set_sockaddr((struct sockaddr *) &dest_addr, sizeof(dest_addr), this->loxone_ip_, this->loxone_port_);
+      int err = this->tcp_client_socket_->connect((struct sockaddr *) &dest_addr, addr_len);
+      if (err == 0) {
+        ESP_LOGD(TAG, "client connected");
+        this->client_ready_ = true;
+      } else if (errno == EINPROGRESS || errno == EWOULDBLOCK) {
+        ESP_LOGD(TAG, "client connecting...");
+        this->tcp_connecting_ = true;
+      } else {
+        ESP_LOGD(TAG, "client connect failed: errno %d", errno);
+        this->tcp_client_socket_ = nullptr;
+      }
+    }
+
+    void LoxoneComponent::poll_tcp_client() {
+      if (this->protocol_ != "tcp" || !this->client_ready_ || this->tcp_client_socket_ == nullptr) {
+        return;
+      }
+
+      uint8_t buf[1024];
+      for (uint8_t i = 0; i < MAX_PACKETS_PER_LOOP; i++) {
+        ssize_t len = this->tcp_client_socket_->read(buf, sizeof(buf));
+        if (len == 0) {
+          ESP_LOGD(TAG, "server closed connection");
+          this->tcp_client_socket_ = nullptr;
+          this->client_ready_ = false;
+          return;
+        }
+        if (len < 0) {
+          if (errno != EWOULDBLOCK && errno != EAGAIN) {
+            ESP_LOGD(TAG, "client read error: errno %d", errno);
+            this->tcp_client_socket_ = nullptr;
+            this->client_ready_ = false;
+          }
+          return;
+        }
+        ESP_LOGD(TAG, "receive data, length=%d, data=%.*s", len, (int) len, (char *) buf);
+        this->receive_string_buffer_.append((char *) buf, len);
+        ESP_LOGD(TAG, "current buffer data=%s", this->receive_string_buffer_.c_str());
+        this->fire_triggers();
+      }
     }
 
     void LoxoneComponent::fire_triggers() {
-      // 检查缓冲区中是否含有 '\n'，即是否有完整的指令
-      if (delimiter_ == "") {
+      if (this->delimiter_ == "") {
         return;
       }
 
       size_t pos;
-      while ((pos = receive_string_buffer_.find(delimiter_)) != std::string::npos) {
-        // 提取完整的指令
-        std::string command = receive_string_buffer_.substr(0, pos);
-        receive_string_buffer_.erase(0, pos + 1); // 从缓冲区中移除这个指令
+      while ((pos = this->receive_string_buffer_.find(this->delimiter_)) != std::string::npos) {
+        std::string command = this->receive_string_buffer_.substr(0, pos);
+        this->receive_string_buffer_.erase(0, pos + this->delimiter_.length());
 
-        // 对每一个完整的指令调用 triggers_ 的 trigger 方法
         if (!command.empty()) {
-          // 假设 triggers_ 是一个能够响应字符串指令的对象
-          for (auto& trigger : string_triggers_) {
+          for (auto &trigger : this->string_triggers_) {
             trigger->trigger(command);
           }
         }
       }
     }
 
-    void LoxoneComponent::ensure_connect_tcp() {
-      if (protocol_ != "tcp") {
-        return;
-      }
-
-      if (tcp_client_.connected()) {
-        if (client_ready_ == false) {
-          ESP_LOGD(TAG, "client connected");
+    void LoxoneComponent::send_data(const std::string &data) {
+      if (this->protocol_ == "udp") {
+        struct sockaddr_storage dest_addr;
+        socklen_t addr_len = socket::set_sockaddr((struct sockaddr *) &dest_addr, sizeof(dest_addr), this->loxone_ip_, this->loxone_port_);
+        this->udp_socket_->sendto(data.c_str(), data.length(), 0, (struct sockaddr *) &dest_addr, addr_len);
+        this->udp_socket_->sendto(this->delimiter_.c_str(), this->delimiter_.length(), 0, (struct sockaddr *) &dest_addr, addr_len);
+      } else if (this->protocol_ == "tcp") {
+        ssize_t written = this->tcp_client_socket_->write(data.c_str(), data.length());
+        if (written < 0 && errno != EWOULDBLOCK && errno != EAGAIN) {
+          ESP_LOGD(TAG, "client write error: errno %d", errno);
+          this->tcp_client_socket_ = nullptr;
+          this->client_ready_ = false;
+          return;
         }
-        client_ready_ = true;
-
-      } else {
-        client_ready_ = false;
-        ESP_LOGD(TAG, "client not connected");
-      }
-
-      if (tcp_client_.connecting()) {
-        ESP_LOGD(TAG, "client still connecting");
-        return;
-      }
-
-      if (client_ready_) {
-        return;
-      }
-
-      if (tcp_client_.connect(loxone_ip_.c_str(), loxone_port_)) {
-        ESP_LOGD(TAG, "client connecting...");
-      } else {
-        ESP_LOGD(TAG, "client connect failed");
+        this->tcp_client_socket_->write(this->delimiter_.c_str(), this->delimiter_.length());
       }
     }
 
-    void LoxoneComponent::ensure_connect_udp() {
-      if (protocol_ != "udp") {
-        return;
-      }
-
-      if (udp_client_.connected()) {
-        if (client_ready_ == false) {
-          ESP_LOGD(TAG, "client connected");
-        }
-
-        client_ready_ = true;
-      } else {
-        client_ready_ = false;
-        ESP_LOGD(TAG, "client not connected");
-      }
-
-      if (!client_ready_) {
-        ip_addr_t addr;
-        ipaddr_aton(loxone_ip_.c_str(), &addr);
-        if (udp_client_.connect(&addr, loxone_port_)) {
-          ESP_LOGD(TAG, "client connecting...");
-        } else {
-          ESP_LOGD(TAG, "client connect failed");
-        }
+    void LoxoneComponent::flush_send_buffer() {
+      while (this->client_ready_ && !this->send_string_buffer_.empty()) {
+        std::string d = this->send_string_buffer_.front();
+        this->send_data(d);
+        ESP_LOGD(TAG, "pop from queue, string data: %s", d.c_str());
+        this->send_string_buffer_.pop();
       }
     }
 
-    void LoxoneComponent::update() {
+    void LoxoneComponent::loop() {
       if (!network::is_connected()) {
-        ESP_LOGD(TAG, "network not ready");
+        if (this->server_ready_ || this->client_ready_ || this->udp_socket_ != nullptr ||
+            this->tcp_listen_socket_ != nullptr || this->tcp_client_socket_ != nullptr) {
+          ESP_LOGD(TAG, "network not ready, tearing down sockets");
+          this->teardown_();
+        }
         return;
       }
 
-      ensure_listen_udp();
-      ensure_listen_tcp();
-      ensure_connect_tcp();
-      ensure_connect_udp();
+      this->ensure_listen_udp();
+      this->ensure_listen_tcp();
+      this->ensure_connect_tcp();
 
-      if (client_ready_) {
-        while (!send_string_buffer_.empty()) {
-          std::string d = send_string_buffer_.front();
-          if (protocol_ == "udp") {
-            udp_client_.print(d.c_str());
-            udp_client_.print(delimiter_.c_str());
-            ESP_LOGD(TAG, "pop from queue, string data: %s", d.c_str());
-          } else if (protocol_ == "tcp") {
-            tcp_client_.add(d.c_str(), strlen(d.c_str()));
-            tcp_client_.add(delimiter_.c_str(), strlen(delimiter_.c_str()));
-            tcp_client_.send();
-            ESP_LOGD(TAG, "pop from queue, string data: %s", d.c_str());
-          }
+      this->poll_udp();
+      this->poll_tcp_server();
+      this->poll_tcp_client();
 
-          send_string_buffer_.pop();
-        }
-      }
+      this->flush_send_buffer();
     }
 
     void LoxoneComponent::send_string_data(std::string data) {
-      if (!client_ready_) {
-        if (send_string_buffer_.size() >= send_buffer_length_) {
+      if (!this->client_ready_) {
+        if (this->send_string_buffer_.size() >= this->send_buffer_length_) {
           ESP_LOGW(TAG, "send buffer is full, discarding some data");
-          send_string_buffer_.pop();
+          this->send_string_buffer_.pop();
         }
 
-        send_string_buffer_.push(data);
+        this->send_string_buffer_.push(data);
         ESP_LOGD(TAG, "client is not ready, push into buffer, string data: %s", data.c_str());
         return;
       }
 
-      if (protocol_ == "udp") {
-        udp_client_.print(data.c_str());
-        udp_client_.print(delimiter_.c_str());
-      } else if (protocol_ == "tcp") {
-        tcp_client_.add(data.c_str(), strlen(data.c_str()));
-        tcp_client_.add(delimiter_.c_str(), strlen(delimiter_.c_str()));
-        tcp_client_.send();
-      } else {
-        return;
-      }
-
+      this->send_data(data);
       ESP_LOGD(TAG, "send string data: %s", data.c_str());
     }
   }

@@ -7,7 +7,8 @@ from esphome.const import (
 )
 from esphome.core import CORE
 
-DEPENDENCIES = ['network', 'socket']
+DEPENDENCIES = ['network']
+AUTO_LOAD = ['socket']
 
 loxone_ns = cg.esphome_ns.namespace('loxone')
 LoxoneComponent = loxone_ns.class_('LoxoneComponent', cg.Component)

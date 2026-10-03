@@ -269,11 +269,15 @@ namespace esphome {
 
     void LoxoneComponent::send_data(const std::string &data) {
       if (this->protocol_ == "udp") {
+        if (this->udp_socket_ == nullptr) return;
         struct sockaddr_storage dest_addr;
         socklen_t addr_len = socket::set_sockaddr((struct sockaddr *) &dest_addr, sizeof(dest_addr), this->loxone_ip_, this->loxone_port_);
-        this->udp_socket_->sendto(data.c_str(), data.length(), 0, (struct sockaddr *) &dest_addr, addr_len);
-        this->udp_socket_->sendto(this->delimiter_.c_str(), this->delimiter_.length(), 0, (struct sockaddr *) &dest_addr, addr_len);
+        //this->udp_socket_->sendto(data.c_str(), data.length(), 0, (struct sockaddr *) &dest_addr, addr_len);
+        //this->udp_socket_->sendto(this->delimiter_.c_str(), this->delimiter_.length(), 0, (struct sockaddr *) &dest_addr, addr_len);
+        std::string packet = data + this->delimiter_;
+        this->udp_socket_->sendto(packet.c_str(), packet.length(), 0, (struct sockaddr *) &dest_addr, addr_len);
       } else if (this->protocol_ == "tcp") {
+        if (this->tcp_client_socket_ == nullptr) return;
         ssize_t written = this->tcp_client_socket_->write(data.c_str(), data.length());
         if (written < 0 && errno != EWOULDBLOCK && errno != EAGAIN) {
           ESP_LOGD(TAG, "client write error: errno %d", errno);

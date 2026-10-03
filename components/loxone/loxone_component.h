@@ -83,7 +83,7 @@ namespace esphome {
       explicit OnStringDataTrigger(LoxoneComponent *parent)
         : parent_(parent){};
 
-      void setup() override { this->parent_->add_string_trigger(this); }
+      // void setup() override { this->parent_->add_string_trigger(this); }
 
     protected:
       LoxoneComponent *parent_;

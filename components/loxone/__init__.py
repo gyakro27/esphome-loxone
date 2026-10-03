@@ -7,22 +7,24 @@ from esphome.const import (
 )
 from esphome.core import CORE
 
-DEPENDENCIES = ['network']
-AUTO_LOAD = ['socket']
+DEPENDENCIES = ["network"]
+AUTO_LOAD = ["socket"]
 
-loxone_ns = cg.esphome_ns.namespace('loxone')
-LoxoneComponent = loxone_ns.class_('LoxoneComponent', cg.Component)
-OnStringDataTrigger = loxone_ns.class_("OnStringDataTrigger",
-                                 automation.Trigger.template(cg.std_string, cg.Component))
+loxone_ns = cg.esphome_ns.namespace("loxone")
+LoxoneComponent = loxone_ns.class_("LoxoneComponent", cg.Component)
+OnStringDataTrigger = loxone_ns.class_(
+    "OnStringDataTrigger",
+    automation.Trigger.template(cg.std_string),
+)
 
 LOXONE_PROTOCOLS = {
     "tcp": "tcp",
-    "udp": "udp"
+    "udp": "udp",
 }
 
 
 def _require_esp_idf(config):
-    if not CORE.using_esp_idf:
+    if CORE.target_framework != "esp-idf":
         raise cv.Invalid(
             "The loxone component requires the esp-idf framework. "
             "Set 'esp32: framework: type: esp-idf' in your configuration."
@@ -30,32 +32,41 @@ def _require_esp_idf(config):
     return config
 
 
-CONFIG_SCHEMA = cv.All(cv.Schema({
-    cv.GenerateID(): cv.declare_id(LoxoneComponent),
-    cv.Required("protocol"): cv.enum(LOXONE_PROTOCOLS),
-    cv.Required("loxone_ip"): cv.ipv4address,
-    cv.Required("loxone_port"): cv.int_range(0, 65535),
-    cv.Required("listen_port"): cv.int_range(0, 65535),
-    cv.Optional("send_buffer_length", default=20): cv.int_range(0, 1024),
-    cv.Optional("delimiter", default="\n"): cv.string,
-    cv.Optional("on_string_data"): automation.validate_automation(
+CONFIG_SCHEMA = cv.All(
+    cv.Schema(
         {
-            cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(OnStringDataTrigger),
+            cv.GenerateID(): cv.declare_id(LoxoneComponent),
+            cv.Required("protocol"): cv.enum(LOXONE_PROTOCOLS, lower=True),
+            cv.Required("loxone_ip"): cv.ipv4address,
+            cv.Required("loxone_port"): cv.port,
+            cv.Required("listen_port"): cv.port,
+            cv.Optional("send_buffer_length", default=20): cv.int_range(1, 1024),
+            cv.Optional("delimiter", default="\n"): cv.string,
+            cv.Optional("on_string_data"): automation.validate_automation(
+                {
+                    cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(OnStringDataTrigger),
+                }
+            ),
         }
-    ),
-}).extend(cv.COMPONENT_SCHEMA), _require_esp_idf)
+    ).extend(cv.COMPONENT_SCHEMA),
+    _require_esp_idf,
+)
 
-def to_code(config):
+
+async def to_code(config):
     var = cg.new_Pvariable(config[CONF_ID])
+    await cg.register_component(var, config)
+
     cg.add(var.set_protocol(config["protocol"]))
     cg.add(var.set_loxone_ip(str(config["loxone_ip"])))
     cg.add(var.set_loxone_port(config["loxone_port"]))
     cg.add(var.set_listen_port(config["listen_port"]))
     cg.add(var.set_send_buffer_length(config["send_buffer_length"]))
     cg.add(var.set_delimiter(config["delimiter"]))
-    yield cg.register_component(var, config)
 
     for conf in config.get("on_string_data", []):
         trigger = cg.new_Pvariable(conf[CONF_TRIGGER_ID], var)
         cg.add(var.add_string_trigger(trigger))
-        yield automation.build_automation(trigger, [(cg.std_string, "data")], conf)
+        await automation.build_automation(
+            trigger, [(cg.std_string, "data")], conf
+        )

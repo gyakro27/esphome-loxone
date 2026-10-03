@@ -7,6 +7,7 @@
 
 #include "esphome/core/component.h"
 #include "esphome/components/socket/socket.h"
+#include "esphome/core/automation.h"
 
 #define TAG "loxone"
 
@@ -75,7 +76,7 @@ namespace esphome {
       void fire_triggers();
     };
 
-    class OnStringDataTrigger : public Trigger<std::string>, public Component {
+    class OnStringDataTrigger : public Trigger<std::string> {
       friend class LoxoneComponent;
 
     public:
